@@ -1,0 +1,67 @@
+name: Build Windows executable
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: source/HackPilot
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract HackPilot source
+        working-directory: .
+        shell: pwsh
+        run: Expand-Archive -LiteralPath HackPilot-Source.zip -DestinationPath source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt "pyinstaller>=6,<8" pytest
+      - name: Check source and bundled resources
+        run: |
+          python -m compileall -q hackpilot
+          python -m hackpilot.main --self-test
+          node --check web/app.js
+      - name: Run regression tests on Windows
+        run: python -m pytest -q
+      - name: Package native Windows executable
+        shell: cmd
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name HackPilot --collect-all webview --collect-all wmi --collect-submodules win32com --collect-submodules hackpilot --add-data "web;web" --add-data "examples;examples" --add-data "hackpilot/windows_scan.ps1;hackpilot" --add-data "hackpilot/usb_list.ps1;hackpilot" hackpilot_launcher.py
+      - name: Test packaged executable and worker
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path './dist/HackPilot.exe').Path
+          function Invoke-ExecutableCheck([string[]] $Arguments) {
+            $process = Start-Process -FilePath $exe -ArgumentList $Arguments -PassThru
+            if (-not $process.WaitForExit(60000)) {
+              Stop-Process -Id $process.Id -Force
+              throw 'Packaged executable check timed out'
+            }
+            $process.Refresh()
+            if ($process.ExitCode -ne 0) { throw "Packaged executable failed: $($process.ExitCode)" }
+          }
+          Invoke-ExecutableCheck -Arguments @('--self-test')
+          Invoke-ExecutableCheck -Arguments @('--worker-smoke', './dist/worker-smoke.txt')
+          if ((Get-Content './dist/worker-smoke.txt' -Raw).Trim() -ne 'hackpilot-worker-ok') {
+            throw 'Packaged worker did not write expected output'
+          }
+          if ((Get-Item $exe).Length -lt 5MB) { throw 'Executable is suspiciously small' }
+          (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower() + '  HackPilot.exe' |
+            Set-Content './dist/HackPilot.exe.sha256' -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HackPilot-Windows-x64
+          path: |
+            source/HackPilot/dist/HackPilot.exe
+            source/HackPilot/dist/HackPilot.exe.sha256
+          if-no-files-found: error
+          retention-days: 30
